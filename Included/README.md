@@ -1,92 +1,70 @@
 Hack The Box: Included — Machine Writeup
 📌 Overview & Metadata
-Field	Detail
-Target	Included (Linux)
-Difficulty	Easy
-Pwn Date	03 Sep 2026
-Techniques	TFTP unauthenticated upload, LFI → RCE, credential reuse, LXD group privesc
-🧠 Concept Breakdown: TFTP & LFI to RCE
+Target: Included (Linux)
 
+Pwn Date: 03 Sep 2026
+
+🧠 Concept Breakdown: TFTP & LFI to RCE
 This machine demonstrates the danger of combining two high-risk misconfigurations:
 
-Trivial File Transfer Protocol (TFTP): An unauthenticated protocol often used for booting operating systems or backing up network configurations. If writable, attackers can upload malicious files with no credentials required.
-Local File Inclusion (LFI): A web vulnerability that lets an attacker force the server to read and render local files. On its own, LFI is a disclosure bug — but when chained with a service that lets an attacker plant a file (like TFTP), it becomes a path to Remote Code Execution (RCE): the "included" file doesn't have to be a static log, it can be a payload the attacker just uploaded.
-🔍 Enumeration
-nmap -sV -Pn [Ip_address]
+Trivial File Transfer Protocol (TFTP): An unauthenticated protocol often used for booting operating systems or backing up network configurations. If writable, attackers can upload malicious files.
 
-Example structure to fill in:
+Local File Inclusion (LFI): A web vulnerability allowing an attacker to read local files on the server. When chained with a service where an attacker can upload a file (like TFTP), LFI can be escalated to Remote Code Execution (RCE) by including the uploaded payload.
 
-bash
-nmap -sC -sV -p- -oN nmap-initial.txt 10.129.51.83
-Ports found: 80
-Web application observed at: http://ip_address
-Parameter identified as vulnerable to LFI: ?file= file
 🚪 Initial Access: TFTP Upload & LFI Execution
+The attack began by leveraging TFTP to upload a PHP reverse shell. I generated a standard PHP PentestMonkey reverse shell payload using revshells.com, configured to connect back to my Kali machine on port 4444.
 
-The attack began by leveraging TFTP to upload a PHP reverse shell. I generated a standard PHP PentestMonkey reverse shell payload (via revshells.com), configured to connect back to my Kali machine on port 4444.
+Using the tftp client, I connected to the target and uploaded the payload:
 
-Using the TFTP client, I connected to the target and uploaded the payload:
-
-bash
+Bash
 tftp 10.129.51.83
 tftp> put shell.php
 tftp> quit
+[Note: Target IPs varied slightly between 10.129.51.64 and 10.129.51.83 during the session due to HTB instance resets]
 
-Note: Target IPs varied slightly between 10.129.51.64 and 10.129.51.83 during the session due to HTB instance resets.
+With the malicious file staged in the default TFTP directory (/var/lib/tftpboot/), I used curl to trigger the web application's LFI vulnerability, instructing the server to execute the payload:
 
-With the malicious file staged in the default TFTP directory (/var/lib/tftpboot/), I used curl to trigger the web application's LFI vulnerability, instructing the server to include and execute the payload:
-
-bash
+Bash
 curl -v "http://10.129.51.83/?file=/var/lib/tftpboot/shell.php"
+This successfully spawned a reverse shell, granting initial access as the www-data user. I immediately stabilized the shell using Python:
 
-This successfully spawned a reverse shell, granting initial access as the www-data user. I immediately stabilized the shell:
-
-bash
+Bash
 python3 -c 'import pty;pty.spawn("/bin/bash")'
 🕵️ Lateral Movement: Web Directory Enumeration
+As www-data, I navigated to the /home/mike directory but was met with a "Permission denied" error when attempting to read user.txt.
 
-As www-data, I navigated to /home/mike but was met with a "Permission denied" error when attempting to read user.txt.
+This required enumerating the local file system for credentials. Investigating the webroot (/var/www/html) revealed a .htpasswd file.
 
-This required enumerating the local filesystem for credentials. Investigating the webroot (/var/www/html) revealed a .htpasswd file:
-
-bash
+Bash
 cat .htpasswd
-mike:[REDACTED]
-
-Using these credentials, I pivoted to the user mike via su and captured the user flag:
-
+mike:Sheffield19
+Using these credentials, I successfully pivoted to the user mike via the su command and captured the user flag:
 User Flag: a56ef91d70cfbf2cdb8f454c006935a1
-🚀 Privilege Escalation: LXD Container Breakout
 
-With a stable shell as mike, the goal shifted to full system compromise. Basic enumeration showed mike did not have standard root privileges or expansive sudo rights, so I looked for alternative escalation paths.
+🚀 Privilege Escalation: LXD Container Breakout
+With a stable shell as mike, my ultimate goal was complete system compromise. However, basic enumeration revealed that mike did not have standard root privileges or expansive sudo rights. I had to seek out alternative paths for privilege escalation.
 
 Checking group memberships revealed a critical vulnerability: mike was a member of the lxd group.
 
 What is the LXD Group?
+LXD is a next-generation system container manager for Linux. Users assigned to the lxd group are granted the authority to manage these containers locally without needing sudo access. From an offensive security perspective, membership in this group is functionally equivalent to having root access. An attacker can exploit this by deploying a new, heavily privileged container and mounting the host machine's entire root filesystem (/) directly into it. Once inside the container, the attacker operates as root and can freely read, modify, or destroy the host's files, completely bypassing standard permission controls.
 
-LXD is a system container manager for Linux. Users in the lxd group can manage containers locally without needing sudo — from an offensive standpoint, this is functionally equivalent to root access. An attacker can deploy a new, heavily privileged container and mount the host's entire root filesystem (/) into it. From inside that container, the attacker operates as root and can read, modify, or destroy the host's files, bypassing standard permission controls entirely.
+Recognizing this misconfiguration, I sought out known LXD tricks and referenced HackTricks documentation to execute the container breakout.
 
-Exploitation
+I began by attempting to download the necessary Alpine Linux builder images (incus.tar.xz and rootfs.squashfs) from my local HTTP server using wget. Initially, I hit a "Permission denied" error because my current working directory was not writable—a standard operational hurdle requiring a quick shift to a writable directory like /tmp or /dev/shm to stage the exploit files.
 
-Referencing known LXD privilege-escalation techniques (HackTricks), I built and imported the necessary Alpine Linux images (incus.tar.xz, rootfs.squashfs) via wget from my local HTTP server.
+After successfully importing the images and initializing the LXC container, I mounted the host's root directory to /mnt/root inside the container and executed a shell:
 
-I initially hit a "Permission denied" error because my working directory wasn't writable — resolved by staging the exploit files in /tmp or /dev/shm instead.
-
-After importing the images and initializing the container with the host root mounted at /mnt/root, I dropped into a shell:
-
-bash
+Bash
 lxc exec privesc /bin/sh
-
-This granted a root shell:
-
-bash
-id
-# uid=0(root) gid=0(root) groups=0(root)
-
-Navigating to the mounted host directory (/mnt/root/root), I captured the final flag:
-
+This successfully granted a root shell (uid=0(root)). I navigated to the mounted host directory (/mnt/root/root) and captured the final flag:
 Root Flag: c693d9c7499d9f572ee375d4c14c7bcf
+
 💡 Lessons Learned
-Vulnerability Chaining — An LFI alone is a disclosure risk, but chaining it with an unauthenticated TFTP upload converts a simple file read into full Remote Code Execution.
-Internal Recklessness — Storing plaintext credentials in .htpasswd files within the webroot provides a trivial path for lateral movement.
-Group Misconfigurations — Adding standard users to administrative or virtualization groups (like lxd or docker) creates a direct, unauthenticated path to root. Administrators must treat these group assignments with the same scrutiny as the sudoers file.
+This box perfectly highlights the methodology of a penetration test:
+
+Vulnerability Chaining: An LFI is dangerous, but chaining it with an unauthenticated TFTP upload converts a simple file read into full Remote Code Execution.
+
+Internal Recklessness: Storing plaintext credentials in .htpasswd files within the webroot provides a trivial path for lateral movement.
+
+Group Misconfigurations: Adding standard users to administrative or virtualization groups (like lxd or docker) creates a direct, unauthenticated path to root. Administrators must treat these group assignments with the same strict scrutiny as the sudoers file.
